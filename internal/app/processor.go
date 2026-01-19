@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -38,73 +39,100 @@ func NewProcessor(cfg *config.Config, l *slog.Logger) *Processor {
 
 func (p *Processor) Run() error {
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:  []string{p.cfg.Kafka.Addr},
-		Topic:    p.cfg.Kafka.Topic,
-		GroupID:  "click-processor-group",
-		MinBytes: 10e3,
-		MaxBytes: 10e6,
+		Brokers: []string{p.cfg.Kafka.Addr},
+		Topic:   p.cfg.Kafka.Topic,
+		GroupID: "click-processor-group",
+		MaxWait: 1 * time.Second,
 	})
 
-	p.logger.Info("Processor started, consuming Kafka...")
+	defer func() {
+		if err := reader.Close(); err != nil {
+			p.logger.Error("error closing reader", "err", err)
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	batch := make([]domain.Click, 0, 1000)
-	ticker := time.NewTicker(5 * time.Second)
+	kafkaMses := make([]kafka.Message, 0, 1000)
 
-	p.logger.Info("Processor started and waiting for messages")
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			p.logger.Info("Shutdown signal received. Flushing remaining data...")
-
+			p.logger.Info("Shutdown signal received")
 			flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-
-			if err := p.flush(flushCtx, batch); err != nil {
-				p.logger.Error("Final flush failed", "error", err)
-			}
-
+			err := p.flushAndCommit(flushCtx, reader, &batch, &kafkaMses)
 			cancel()
-
+			if err != nil {
+				return fmt.Errorf("final flush failed: %w", err)
+			}
 			return nil
 
 		case <-ticker.C:
 			if len(batch) > 0 {
-				if err := p.flush(ctx, batch); err != nil {
+				fCtx, fCancel := context.WithTimeout(ctx, 3*time.Second)
+				if err := p.flushAndCommit(fCtx, reader, &batch, &kafkaMses); err != nil {
 					p.logger.Error("Ticker flush failed", "error", err)
 				}
-				batch = batch[:0]
+				fCancel()
 			}
 
 		default:
 			m, err := reader.FetchMessage(ctx)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
-					continue
+					return nil
 				}
+				p.logger.Error("Fetch error", "err", err)
+
 				continue
 			}
 
 			var click domain.Click
 			if err := json.Unmarshal(m.Value, &click); err != nil {
 				p.logger.Error("Unmarshal error", "error", err)
+				_ = reader.CommitMessages(ctx, m)
+
 				continue
 			}
 
 			batch = append(batch, click)
+			kafkaMses = append(kafkaMses, m) // Запоминаем сообщение
 
 			if len(batch) >= 1000 {
-				if err := p.flush(ctx, batch); err != nil {
+				fCtx, fCancel := context.WithTimeout(ctx, 3*time.Second)
+				if err := p.flushAndCommit(fCtx, reader, &batch, &kafkaMses); err != nil {
 					p.logger.Error("Size flush failed", "error", err)
 				}
-				batch = batch[:0]
+				fCancel()
 			}
-
-			_ = reader.CommitMessages(ctx, m)
 		}
 	}
+}
+
+func (p *Processor) flushAndCommit(ctx context.Context, r *kafka.Reader, clicks *[]domain.Click, megs *[]kafka.Message) error {
+	if len(*clicks) == 0 {
+		return nil
+	}
+
+	if err := p.chRepo.BatchInsert(ctx, *clicks); err != nil {
+		return err
+	}
+
+	if err := r.CommitMessages(ctx, *megs...); err != nil {
+		return fmt.Errorf("kafka commit error: %w", err)
+	}
+
+	p.logger.Info("batch processed successfully", "count", len(*clicks))
+
+	*clicks = (*clicks)[:0]
+	*megs = (*megs)[:0]
+
+	return nil
 }
 
 func (p *Processor) flush(ctx context.Context, clicks []domain.Click) error {
